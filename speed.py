@@ -1,170 +1,155 @@
 import cv2
-from time import time
-from ultralytics import YOLO
-import random
+import pandas as pd
 import numpy as np
+import time
+from ultralytics import YOLO
+import cvzone
+import Tracker as T  # Import your custom tracker module
 
-class ObjectDetection:
-    def __init__(self):
-        self.model = self.load_model()
-        self.output_video = "output/output.avi"
-        self.tracker = {}
-    
-    def load_model(self):
-        model = YOLO("yolov8m.pt")  # Load a pretrained YOLOv8 model
-        model.fuse()
-        return model
-    
-    def detect_colors(self, class_list):
-        detection_colors = []
-        for _ in class_list:
-            r = random.randint(0, 255)
-            g = random.randint(0, 255)
-            b = random.randint(0, 255)
-            detection_colors.append((b, g, r))
-        return detection_colors
-    
-    def process_frame(self, frame):
-        results = self.model(frame)  # Get detection results
-        annotated_frame = results[0].plot()  # Get annotated frame with bounding boxes
-        return annotated_frame
+# Load YOLOv8 model
+model = YOLO('yolov8n.pt')
 
-    def plot_bboxes(self, Dnum, frame, detect, class_list, start_time):
-        speed_kmh=0
-        if len(Dnum) != 0:
-            detection_colors = self.detect_colors(class_list)
-            for i in range(len(detect[0])):
-                boxes = detect[0].boxes
-                box = boxes[i]  # returns one box
-                clsID = box.cls.numpy()[0]
-                conf = box.conf.numpy()[0]
-                bb = box.xyxy.numpy()[0]
+# Initialize video capture
+cap = cv2.VideoCapture(r"C:\Users\Hashi\speed\video4.mp4")
+if not cap.isOpened():
+    print("Error: Could not open video.")
+    exit()
 
-                # Speed estimation for vehicles
-                if class_list[int(clsID)] in ['car', 'truck', 'bus']:
-                    center_x = (bb[0] + bb[2]) / 2
-                    center_y = (bb[1] + bb[3]) / 2
+# Read class names from coco.txt file
+with open(r"C:\Users\Hashi\speed\coco.txt", "r") as my_file:
+    data = my_file.read()
+class_list = data.split("\n")
 
-                    vehicle_id = f"vehicle_{int(center_x)}"
-                    if vehicle_id not in self.tracker:
-                        self.tracker[vehicle_id] = {"last_position": (center_x, center_y), "last_time": start_time}
+# Initialize trackers
+tracker = T.Tracker()
+tracker1 = T.Tracker()
+tracker2 = T.Tracker()
 
-                    else:
-                        last_position = self.tracker[vehicle_id]["last_position"]
-                        last_time = self.tracker[vehicle_id]["last_time"]
-                        current_time = start_time
+# Variables for speed estimation
+previous_positions = {}
+car_speeds = {}
+scale_meters_per_pixel = 0.08  # Adjusted to better reflect real-world distances
+min_movement_threshold = 1.17  # Movement threshold in pixels for stationary detection
+min_speed_kmh = 0  # Set minimum speed to 0 for stationary cars
 
+# Function to calculate speed with improved smoothing and zero handling
+def calculate_speed(pos1, pos2, time_elapsed, previous_speed=0, alpha=0.2, scale=1):
+    if time_elapsed > 0:
+        distance_in_pixels = np.linalg.norm(np.array(pos2) - np.array(pos1))
 
-                        distance_pixels = ((center_x - last_position[0])**2 + (center_y - last_position[1])**2) ** 0.5
-                        time_elapsed = current_time - last_time
-                        
-                        if time_elapsed > 0:
-                            speed_pixels_per_sec = distance_pixels / time_elapsed
-                            speed_mps = speed_pixels_per_sec
+        # Detect if the vehicle is stationary
+        if distance_in_pixels < min_movement_threshold:
+            return 0  # Set speed to 0 for stationary vehicle
 
-                            speed_kmh = speed_mps * 3.6
+        distance_in_meters = distance_in_pixels * scale
+        speed_mps = distance_in_meters / time_elapsed
+        speed_kmh = speed_mps * 3.6 * 2  # Adjust the speed by a factor if needed
 
-                            self.tracker[vehicle_id]["last_position"] = (center_x, center_y)
-                            self.tracker[vehicle_id]["last_time"] = current_time
+        # Smooth speed using EMA
+        smoothed_speed = (alpha * speed_kmh) + ((1 - alpha) * previous_speed)
+        return max(smoothed_speed, min_speed_kmh)  # Avoid negative speeds
+    else:
+        return previous_speed
 
+# Function to check if the camera is stationary
+def is_camera_stationary(frame1, frame2, threshold=2):
+    gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
 
-                cv2.rectangle(
-                    frame,
-                    (int(bb[0]), int(bb[1])),
-                    (int(bb[2]), int(bb[3])),
-                    detection_colors[int(clsID)],
-                    3,
-                )
-                font = cv2.FONT_HERSHEY_COMPLEX_SMALL
-                end_time = time()
-                fps = 1 / (end_time - start_time)
-                cv2.putText(
-                    frame,
-                    f"{class_list[int(clsID)]} ,{round(speed_kmh, 2)} km/h",
-                    (int(bb[0]), int(bb[1]) - 10),
-                    font,
-                    1,
-                    (255, 255, 255),
-                    2,
-                )
-    
-    def estimate_speed(self, bbox, frame, start_time):
-        # Assuming the distance in pixels to meters is 1:1 for simplicity
-        center_x = (bbox[0] + bbox[2]) / 2
-        center_y = (bbox[1] + bbox[3]) / 2
+    orb = cv2.ORB_create()
+    kp1, des1 = orb.detectAndCompute(gray1, None)
+    kp2, des2 = orb.detectAndCompute(gray2, None)
 
-        # Use a simple approach to identify unique vehicles
-        vehicle_id = f"vehicle_{int(center_x)}"
-        if vehicle_id not in self.tracker:
-            self.tracker[vehicle_id] = {"last_position": (center_x, center_y), "last_time": start_time}
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
 
-        # Calculate speed if this vehicle was seen before
-        else:
-            last_position = self.tracker[vehicle_id]["last_position"]
-            last_time = self.tracker[vehicle_id]["last_time"]
-            current_time = start_time
-            
-            # Calculate distance in pixels
-            distance_pixels = ((center_x - last_position[0])**2 + (center_y - last_position[1])**2) ** 0.5
-            time_elapsed = current_time - last_time
-            
-            if time_elapsed > 0:
-                speed_pixels_per_sec = distance_pixels / time_elapsed
-                speed_mps = speed_pixels_per_sec  # Speed in meters per second
+    movements = [m.distance for m in matches]
 
-                # Convert speed to km/h
-                speed_kmh = speed_mps * 3.6
+    return np.mean(movements) < threshold  # Camera is stationary if movements are below threshold
 
-                # Update the last position and time
-                self.tracker[vehicle_id]["last_position"] = (center_x, center_y)
-                self.tracker[vehicle_id]["last_time"] = current_time
+# Main loop with updated speed calculation
+try:
+    previous_frame = None
+    is_dynamic_camera = True
 
-                # Display speed on the frame
-                cv2.putText(frame, f"{round(speed_kmh, 2)} km/h", (int(center_x), int(center_y)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame or end of video")
+            break
 
-    def open_video(self):
-        cap = cv2.VideoCapture("highway_mini.mp4")
-        assert cap.isOpened()
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        return cap
-    
-    def open_dataset(self):
-        with open("coco.txt") as my_file:
-            data = my_file.read()
-        class_list = data.split("\n")
-        return class_list
+        frame = cv2.resize(frame, (640, 360))
 
-    def __call__(self):
-        cap = self.open_video()
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_vid = 640
-        frame_hyt = 480
-        class_list = self.open_dataset()
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(self.output_video, fourcc, fps, (int(cap.get(3)), int(cap.get(4))))
+        # Check if the camera is stationary
+        if previous_frame is not None:
+            is_dynamic_camera = not is_camera_stationary(previous_frame, frame)
 
-        while True:
-            start_time = time()
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # Run object detection
+        results = model.predict(frame, conf=0.5, iou=0.4)
+        a = results[0].boxes.data
+        px = pd.DataFrame(a).astype("float")
 
-            annot_frame = self.process_frame(frame)
-            frame = cv2.resize(frame, (frame_vid, frame_hyt))
-            detect = self.model.predict(source=[frame], conf=0.45, save=False)
-            Dnum = detect[0].numpy()
-            self.plot_bboxes(Dnum, frame, detect, class_list, start_time)
-            out.write(annot_frame)
+        cars, buses, trucks = [], [], []
+        for index, row in px.iterrows():
+            x1 = int(row[0])
+            y1 = int(row[1])
+            x2 = int(row[2])
+            y2 = int(row[3])
+            d = int(row[5])
 
-            cv2.imshow('objectdetection', frame)
-            if cv2.waitKey(1) == ord("q"):
-                break
+            if 'car' in class_list[d]:
+                cars.append([x1, y1, x2, y2])
+            elif 'bus' in class_list[d]:
+                buses.append([x1, y1, x2, y2])
+            elif 'truck' in class_list[d]:
+                trucks.append([x1, y1, x2, y2])
 
-        cap.release()
-        out.release()
-        cv2.destroyAllWindows()
+        # Update trackers
+        bbox_idx_cars = tracker.update(cars)
+        bbox_idx_buses = tracker1.update(buses)
+        bbox_idx_trucks = tracker2.update(trucks)
 
-detector = ObjectDetection()
-detector()
+        # Track position and calculate speed for cars
+        current_time = time.time()
+        for bbox in bbox_idx_cars:
+            x3, y3, x4, y4, id1 = bbox
+            cx3 = int((x3 + x4) / 2)
+            cy3 = int(y4)
+            center = (cx3, cy3)
+
+            if id1 not in previous_positions:
+                previous_positions[id1] = (center, current_time)
+            else:
+                prev_center, prev_time = previous_positions[id1]
+                time_diff = current_time - prev_time
+
+                if time_diff > 0:
+                    previous_speed = car_speeds.get(id1, 0)
+                    speed = calculate_speed(prev_center, center, time_diff, previous_speed,
+                                            scale=scale_meters_per_pixel)
+                    car_speeds[id1] = speed
+
+                previous_positions[id1] = (center, current_time)
+
+            # Display speed for each car
+            speed_text = f"Speed: {car_speeds.get(id1, 0):.2f} km/h"
+            cvzone.putTextRect(frame, speed_text, (x3, y4 + 15), scale=0.8, thickness=2, offset=3,
+                               colorR=(0, 128, 0), colorT=(0, 0, 0))
+
+            # Draw bounding box
+            cv2.rectangle(frame, (x3, y3), (x4, y4), (0, 128, 0), 4)
+            cvzone.putTextRect(frame, f'Car {id1}', (x3, y3 - 10), scale=1.0, thickness=1)
+
+        # Display the frame
+        cv2.imshow("Vehicle Detection and Speed Estimation", frame)
+
+        previous_frame = frame  # Store current frame for next iteration
+        if cv2.waitKey(1) & 0xFF == 27:  # Exit on ESC key
+            break
+
+except Exception as e:
+    print(f"Error: {str(e)}")
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
